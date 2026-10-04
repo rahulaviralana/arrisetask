@@ -1,0 +1,654 @@
+DevOps Infrastructure Engineer III - Assignment
+
+
+Task 1 - Multi-Instance EC2 Provisioning
+
+Directory layout:
+  modules/ec2-fleet/versions.tf
+  modules/ec2-fleet/variables.tf
+  modules/ec2-fleet/main.tf
+  modules/ec2-fleet/outputs.tf
+  main.tf
+  backend.tf  (Task 2)
+
+
+modules/ec2-fleet/versions.tf
+
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+
+modules/ec2-fleet/variables.tf
+
+variable "instances" {
+  description = "Map of all 5 EC2 instance configurations"
+  type = map(object({
+    instance_type = string
+    volume_type   = string
+    volume_size   = number
+    key_name      = string
+    iops          = optional(number, null)
+  }))
+}
+
+variable "ami_id"      { type = string }
+variable "environment" { type = string }
+variable "owner"       { type = string }
+
+
+modules/ec2-fleet/main.tf
+
+resource "aws_instance" "fleet" {
+  for_each = var.instances
+
+  ami           = var.ami_id
+  instance_type = each.value.instance_type
+  key_name      = each.value.key_name
+
+  root_block_device {
+    volume_type = each.value.volume_type
+    volume_size = each.value.volume_size
+    iops        = each.value.iops
+  }
+
+  tags = {
+    Name        = each.key
+    Environment = var.environment
+    Owner       = var.owner
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+
+modules/ec2-fleet/outputs.tf
+
+output "instance_ids" {
+  description = "Map of instance name to instance ID"
+  value       = { for k, v in aws_instance.fleet : k => v.id }
+}
+
+output "private_ips" {
+  description = "Map of instance name to private IP"
+  value       = { for k, v in aws_instance.fleet : k => v.private_ip }
+}
+
+
+main.tf
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "ap-south-1"
+}
+
+module "ec2_fleet" {
+  source = "./modules/ec2-fleet"
+
+  ami_id      = "ami-0f5ee92e2d63afc18"
+  environment = "production"
+  owner       = "devops-team"
+
+  instances = {
+    "web-server-1" = {
+      instance_type = "t3.medium"
+      volume_type   = "gp3"
+      volume_size   = 30
+      key_name      = "web-keypair"
+    }
+    "web-server-2" = {
+      instance_type = "t3.large"
+      volume_type   = "gp2"
+      volume_size   = 50
+      key_name      = "api-keypair"
+    }
+    "cache-server" = {
+      instance_type = "r5.large"
+      volume_type   = "io1"
+      volume_size   = 100
+      key_name      = "cache-keypair"
+      iops          = 3000
+    }
+    "batch-worker" = {
+      instance_type = "c5.xlarge"
+      volume_type   = "standard"
+      volume_size   = 20
+      key_name      = "batch-keypair"
+    }
+    "db-primary-prod" = {
+      instance_type = "m5.xlarge"
+      volume_type   = "io2"
+      volume_size   = 150
+      key_name      = "db-keypair"
+      iops          = 3000
+    }
+  }
+}
+
+output "instance_ids" {
+  value = module.ec2_fleet.instance_ids
+}
+
+output "private_ips" {
+  value = module.ec2_fleet.private_ips
+}
+
+
+---
+
+Task 2 - Remote State and Locking
+
+The S3 bucket and DynamoDB table need to exist before adding the backend block.
+I create them first using the bootstrap workspace below, then add backend.tf and
+run terraform init -migrate-state to move local state into S3.
+
+
+backend.tf
+
+terraform {
+  backend "s3" {
+    bucket         = "my-company-terraform-state"
+    key            = "ec2-fleet/terraform.tfstate"
+    region         = "ap-south-1"
+    dynamodb_table = "terraform-state-lock"
+    encrypt        = true
+  }
+}
+
+
+state-bootstrap/main.tf
+
+provider "aws" {
+  region = "ap-south-1"
+}
+
+resource "aws_s3_bucket" "terraform_state" {
+  bucket = "my-company-terraform-state"
+}
+
+resource "aws_s3_bucket_versioning" "terraform_state" {
+  bucket = aws_s3_bucket.terraform_state.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "terraform_state" {
+  bucket = aws_s3_bucket.terraform_state.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "terraform_state" {
+  bucket                  = aws_s3_bucket.terraform_state.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_dynamodb_table" "terraform_lock" {
+  name         = "terraform-state-lock"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockID"
+
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+}
+
+
+---
+
+Task 3 - Multi-Account IAM and Cross-Account Access
+
+account-a/iam.tf
+
+provider "aws" {
+  region = "ap-south-1"
+}
+
+resource "aws_iam_user" "engine" { name = "engine" }
+resource "aws_iam_user" "ci"     { name = "ci"     }
+resource "aws_iam_user" "alice"  { name = "alice"  }
+resource "aws_iam_user" "bob"    { name = "bob"    }
+
+resource "aws_iam_group" "group1" { name = "group1" }
+
+resource "aws_iam_group_policy" "group1_deny_console" {
+  name  = "deny-console-access"
+  group = aws_iam_group.group1.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "DenyConsoleLogin"
+        Effect = "Deny"
+        Action = [
+          "iam:CreateLoginProfile",
+          "iam:UpdateLoginProfile",
+          "iam:DeleteLoginProfile",
+          "iam:GetLoginProfile"
+        ]
+        Resource = "arn:aws:iam::000000000000:user/*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_group_membership" "group1" {
+  name  = "group1-membership"
+  group = aws_iam_group.group1.name
+  users = [aws_iam_user.engine.name, aws_iam_user.ci.name]
+}
+
+resource "aws_iam_group" "group2" { name = "group2" }
+
+resource "aws_iam_group_policy_attachment" "group2_admin" {
+  group      = aws_iam_group.group2.name
+  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+}
+
+resource "aws_iam_group_membership" "group2" {
+  name  = "group2-membership"
+  group = aws_iam_group.group2.name
+  users = [aws_iam_user.alice.name, aws_iam_user.bob.name]
+}
+
+resource "aws_iam_role" "roleA" {
+  name = "roleA"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { AWS = "arn:aws:iam::000000000000:root" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "roleA_policy" {
+  name = "admin-except-iam"
+  role = aws_iam_role.roleA.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "AllowEverything"
+        Effect   = "Allow"
+        Action   = "*"
+        Resource = "*"
+      },
+      {
+        Sid      = "DenyIAM"
+        Effect   = "Deny"
+        Action   = "iam:*"
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role" "roleB" {
+  name = "roleB"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { AWS = "arn:aws:iam::000000000000:root" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "roleB_assume_roleC" {
+  name = "assume-roleC-only"
+  role = aws_iam_role.roleB.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "sts:AssumeRole"
+      Resource = "arn:aws:iam::111111111111:role/roleC"
+    }]
+  })
+}
+
+
+account-b/iam.tf
+
+provider "aws" {
+  region = "ap-south-1"
+}
+
+resource "aws_iam_role" "roleC" {
+  name = "roleC"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { AWS = "arn:aws:iam::000000000000:role/roleB" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "roleC_s3" {
+  name = "roleC-s3-full-access-single-bucket"
+  role = aws_iam_role.roleC.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "s3:*"
+      Resource = [
+        "arn:aws:s3:::cross-account-data-bucket",
+        "arn:aws:s3:::cross-account-data-bucket/*"
+      ]
+    }]
+  })
+}
+
+
+---
+
+Task 4 - Least-Privilege IAM Policy for ci User
+
+ci-policy.json
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ECRGetToken",
+      "Effect": "Allow",
+      "Action": ["ecr:GetAuthorizationToken"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ECRPushImage",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage"
+      ],
+      "Resource": "arn:aws:ecr:ap-south-1:000000000000:repository/my-app"
+    },
+    {
+      "Sid": "ECSRegisterTaskDef",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:RegisterTaskDefinition",
+        "ecs:DescribeTaskDefinition"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ECSUpdateService",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:UpdateService",
+        "ecs:DescribeServices"
+      ],
+      "Resource": "arn:aws:ecs:ap-south-1:000000000000:service/my-cluster/my-service"
+    },
+    {
+      "Sid": "PassECSTaskExecutionRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::000000000000:role/ecs-task-execution-role",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "S3ArtifactsRead",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": [
+        "arn:aws:s3:::ci-build-artifacts",
+        "arn:aws:s3:::ci-build-artifacts/*"
+      ]
+    }
+  ]
+}
+
+
+---
+
+Task 5 - Find and Fix the Bug
+
+Original broken code:
+
+  data "aws_iam_policy_document" "roleC_trust" {
+    statement {
+      effect  = "Allow"
+      actions = ["sts:AssumeRole"]
+      principals {
+        type        = "AWS"
+        identifiers = ["arn:aws:iam::000000000000:user/roleB"]
+      }
+    }
+  }
+
+  resource "aws_iam_role_policy" "roleC_s3" {
+    ...
+    policy = jsonencode({
+      Version = "2012-10-17"
+      Statement = [{
+        Effect   = "Allow"
+        Action   = "s3:*"
+        Resource = "*"
+      }]
+    })
+  }
+
+Bug 1 - Trust policy uses wrong principal type
+
+The ARN says user/roleB but roleB is an IAM role, not a user. AWS evaluates
+the ARN literally so the assume will always fail with AccessDenied even though
+everything else looks correct.
+
+  Wrong:  "arn:aws:iam::000000000000:user/roleB"
+  Fixed:  "arn:aws:iam::000000000000:role/roleB"
+
+Bug 2 - Permissions policy scoped to all buckets
+
+Resource = "*" gives roleC full S3 access to every bucket in every account.
+The requirement is full access to one specific bucket. The action s3:* is
+fine here because the task says full access, but the resource needs to be
+locked down to just the one bucket.
+
+  Wrong:  Resource = "*"
+  Fixed:  Resource = ["arn:aws:s3:::cross-account-data-bucket",
+                       "arn:aws:s3:::cross-account-data-bucket/*"]
+
+Fixed code:
+
+  data "aws_iam_policy_document" "roleC_trust" {
+    statement {
+      effect  = "Allow"
+      actions = ["sts:AssumeRole"]
+      principals {
+        type        = "AWS"
+        identifiers = ["arn:aws:iam::000000000000:role/roleB"]
+      }
+    }
+  }
+
+  resource "aws_iam_role" "roleC" {
+    name               = "roleC"
+    assume_role_policy = data.aws_iam_policy_document.roleC_trust.json
+  }
+
+  resource "aws_iam_role_policy" "roleC_s3" {
+    name = "roleC-s3-access"
+    role = aws_iam_role.roleC.id
+    policy = jsonencode({
+      Version = "2012-10-17"
+      Statement = [{
+        Effect   = "Allow"
+        Action   = "s3:*"
+        Resource = [
+          "arn:aws:s3:::cross-account-data-bucket",
+          "arn:aws:s3:::cross-account-data-bucket/*"
+        ]
+      }]
+    })
+  }
+
+
+---
+
+NOTES
+
+Task 1 - Why db-primary-prod is protected
+
+I went with db-primary-prod for the lifecycle protection. It's the only
+stateful instance in the group - it's running the primary production database
+on io2 storage, so if it gets accidentally destroyed that's data loss with no
+clean recovery path. The other four instances are either stateless or can be
+rebuilt fairly easily from snapshots or re-bootstrapped.
+
+One thing worth noting on the Terraform side: prevent_destroy is a static
+lifecycle attribute and can't be set conditionally per iteration in a for_each
+block. Terraform processes lifecycle blocks at plan time before it has the
+iteration context, so there's no way to pass in a variable that says "only
+protect this one key." The practical workaround without breaking the single
+variable requirement is to apply prevent_destroy = true across all five, which
+is actually safer anyway since none of them can be accidentally destroyed. If
+the strict requirement is really just one instance, the options are a separate
+resource block for that instance, a Terraform Cloud Sentinel policy, or an
+AWS Config rule.
+
+Also on volume types - AWS only supports gp2, gp3, io1, io2, and standard as
+root volume types. st1 and sc1 are HDD types that can be attached as data
+volumes but not used for booting. I used standard for the batch worker purely
+to get a fifth distinct root volume type since all the sensible ones were
+already taken. In a real setup that server would be on gp3 or io1.
+
+io1 and io2 both require an explicit iops value in Terraform so I added an
+optional iops field to the variable. The optional() function needs Terraform
+1.3+ which is why there's a required_version in versions.tf.
+
+
+Task 2 - Concurrent apply with local state
+
+If two people run terraform apply at the same time against local state, both
+start by reading the same state file snapshot before any changes exist. Both
+compute identical diffs and start creating resources in parallel. You end up
+with duplicate resources that Terraform doesn't know about, a corrupted state
+file where whoever writes last wins and overwrites the other person's resource
+IDs, or partial failures where one apply succeeds halfway and the other fails,
+leaving the state out of sync with what's actually deployed.
+
+With S3 and DynamoDB, Terraform writes a lock entry to DynamoDB at the start
+of any operation that modifies state. A second apply that comes in while that
+lock is held will read it and immediately exit with an error saying the state
+is locked. The lock is released when the first apply finishes whether it
+succeeds or fails, so the second engineer can try again after that.
+
+
+Task 3 - Would you give engine and ci IAM users with access keys in production?
+
+No. Long-lived access keys are a genuine risk - they end up in git history,
+CI environment variable dumps, S3 buckets, all kinds of places. The better
+approach depends on what the principal is.
+
+For ci, which is a CI pipeline, I'd set up OIDC federation between AWS and
+the CI provider (GitHub Actions, GitLab, etc.). The pipeline gets a short-lived
+token from the CI system and exchanges it for temporary AWS credentials via
+sts:AssumeRoleWithWebIdentity. No static key ever gets created or stored.
+
+For engine, which sounds like it's a service or application, I'd attach an
+IAM role directly to the compute it runs on - an EC2 instance profile, ECS
+task role, or Lambda execution role depending on what it is. The SDK picks
+up credentials from the instance metadata service automatically and they
+rotate every few hours without anyone having to manage them.
+
+If something absolutely requires a static key and there's no way around it,
+store it in Secrets Manager with automatic rotation via a Lambda function and
+set an alert for any key that goes past 90 days old.
+
+
+Task 3 - Trust policy: account root vs specific role ARN
+
+Trusting arn:aws:iam::000000000000:root means AWS hands the decision over
+to Account A entirely. Any Account A principal that has sts:AssumeRole on
+roleC in their own policy can assume it. So the security of roleC depends
+completely on Account A not handing that permission out to the wrong people,
+which is outside Account B's control.
+
+Trusting the specific ARN arn:aws:iam::000000000000:role/roleB means only
+that exact role can assume roleC, full stop. Even if another Account A
+principal somehow has sts:AssumeRole on * in their identity policy, roleC's
+trust policy will reject them because they aren't roleB. The restriction is
+enforced on Account B's side, so Account B doesn't have to trust Account A's
+internal access controls to stay secure.
+
+General rule: always trust the most specific ARN you can in cross-account
+trust policies. Account root trust is sometimes unavoidable when bootstrapping
+but should be replaced with specific ARNs once the exact principal is known.
+
+
+Task 4 - What I left out of the ci policy and why
+
+ecr:GetDownloadUrlForLayer and ecr:BatchGetImage - these are pull operations.
+The pipeline only needs to push, so there's no reason to include them.
+
+ecr:DeleteRepository, ecr:BatchDeleteImage, ecr:SetRepositoryPolicy - CI
+should never be deleting repos or images or modifying repo policies. That's
+an ops concern managed separately.
+
+ecs:CreateService, ecs:DeleteService, ecs:CreateCluster, ecs:DeleteCluster -
+the service already exists, CI is just updating it. Creating or deleting
+clusters and services is completely out of scope.
+
+ecs:RunTask, ecs:StartTask - direct task invocation isn't part of a standard
+deploy flow. CI updates the service definition and ECS handles scheduling.
+
+s3:PutObject and s3:DeleteObject on the artifact bucket - the CI user reads
+artifacts from this bucket, it doesn't write them. A different role in the
+build phase handles writing. Retention is managed by S3 lifecycle rules, not
+by CI.
+
+iam:* except for the narrow PassRole - CI should never touch IAM. The one
+exception is iam:PassRole which ECS requires when you register a task
+definition that references an execution role. I've scoped it to the exact
+execution role ARN and added a condition so it can only be passed to
+ecs-tasks.amazonaws.com and not to any other service.
+
+One thing that looks odd but is intentional: ecr:GetAuthorizationToken has
+Resource set to *. That's an AWS constraint, not a mistake. The action
+generates a login token for the registry endpoint itself, not for a specific
+repository, so AWS doesn't allow it to be scoped to a resource ARN.
